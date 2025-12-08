@@ -1,0 +1,55 @@
+
+
+# --- 에디터 설정 폴더 (내 설정이 남에게 강요되지 않게) ---
+.vscode/
+.idea/
+
+# --- 보안 관련 파일 (절대 올리면 안 됨!) ---
+.env
+config.js
+secrets.json
+*.pem
+
+# --- Python (파이썬 쓴다면 필수) ---
+__pycache__/
+*.pyc
+venv/
+env/
+.venv/
+
+# --- AI/ML 모델 및 데이터셋 (용량이 커서 깃허브 업로드 불가) ---
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.pkl
+# --- 데이터 파일 (필요시 제외) ---
+*.jsonl
+*.json
+*.csv
+/data/
+/datasets/
+/output/
+/logs/
+/results/
+
+# --- 학습 결과 저장 폴더 (가장 중요) ---
+# 이 폴더 안에 체크포인트와 모델이 계속 쌓이므로 통째로 무시해야 합니다.
+manufacturing_lora_output/
+
+# --- 체크포인트 폴더 패턴 ---
+checkpoint-*/
+
+# --- 데이터셋 파일 (용량이 크다면 제외 추천) ---
+# 1_data_generation/sft_data 안에 있는 데이터들입니다.
+*.jsonl
+sft_data/
+
+# --- RAG 지식 베이스 문서 (보안상 중요) ---
+# 3_knowledge_base 안에 회사 매뉴얼이나 기밀 문서가 있다면 제외하세요.
+# 만약 코드로만 된 가짜 데이터라면 안 넣어도 됩니다.
+knowledge_base/manuals/
+knowledge_base/sop/
+knowledge_base/histories/
