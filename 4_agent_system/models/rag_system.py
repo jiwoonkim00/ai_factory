@@ -8,14 +8,21 @@ from typing import List, Dict, Optional
 import torch
 
 try:
-    from langchain.embeddings import HuggingFaceEmbeddings
-    from langchain.vectorstores import FAISS
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    from langchain.docstore.document import Document
+    # 최신 langchain-huggingface 사용 (경고 제거)
+    try:
+        from langchain_huggingface import HuggingFaceEmbeddings
+    except ImportError:
+        # Fallback to deprecated version
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+    
+    from langchain_community.vectorstores import FAISS
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain_core.documents import Document
     LANGCHAIN_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     LANGCHAIN_AVAILABLE = False
-    print("⚠️  LangChain 미설치: pip install langchain faiss-cpu sentence-transformers")
+    print(f"⚠️  LangChain 모듈 로드 실패: {e}")
+    print("   필요 패키지: pip install langchain langchain-community langchain-text-splitters langchain-huggingface faiss-cpu sentence-transformers")
 
 try:
     import chromadb
@@ -35,17 +42,44 @@ class RAGSystem:
             knowledge_base_path: 지식 베이스 경로 (None이면 자동 탐지)
             use_chromadb: ChromaDB 사용 여부 (True면 ChromaDB, False면 FAISS)
         """
+        # 디버깅: 받은 파라미터 확인
+        print(f"🔍 RAGSystem.__init__ 호출됨:")
+        print(f"   - knowledge_base_path: {knowledge_base_path}")
+        print(f"   - type: {type(knowledge_base_path)}")
+        print(f"   - use_chromadb: {use_chromadb}")
+        
         # 경로 자동 설정
         if knowledge_base_path is None:
-            from ..utils.config import KNOWLEDGE_BASE_PATH, VECTOR_DB_PATH
-            knowledge_base_path = str(KNOWLEDGE_BASE_PATH)
-            self.vector_db_path = str(VECTOR_DB_PATH)
+            try:
+                from utils.config import KNOWLEDGE_BASE_PATH, VECTOR_DB_PATH
+                knowledge_base_path = str(KNOWLEDGE_BASE_PATH)
+                self.vector_db_path = str(VECTOR_DB_PATH)
+            except ImportError:
+                # config 로드 실패 시 기본 경로 사용
+                import os
+                # models/rag_system.py -> models -> 4_agent_system -> project_root
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                knowledge_base_path = os.path.join(project_root, "3_knowledge_base", "knowledge_base")
+                self.vector_db_path = os.path.join(project_root, "3_knowledge_base", "vector_db")
         else:
-            self.vector_db_path = None
+            # knowledge_base_path가 전달된 경우에도 vector_db_path 설정
+            # Path 객체로 변환하여 안전하게 처리
+            from pathlib import Path
+            kb_path = Path(knowledge_base_path).resolve()  # 절대 경로로 변환
+            
+            # knowledge_base 폴더의 형제 폴더로 vector_db 설정
+            # 예: /path/3_knowledge_base/knowledge_base -> /path/3_knowledge_base/vector_db
+            if kb_path.name == 'knowledge_base':
+                # 마지막이 knowledge_base면 부모의 vector_db
+                self.vector_db_path = str(kb_path.parent / 'vector_db')
+            else:
+                # 아니면 같은 레벨에 vector_db
+                self.vector_db_path = str(kb_path / 'vector_db')
         
         self.knowledge_base_path = knowledge_base_path
         self.use_chromadb = use_chromadb and CHROMADB_AVAILABLE
         self.embeddings = None
+        self.embedding_model = None  # sentence-transformers 모델 (ChromaDB용)
         self.vectorstore = None
         self.chroma_collection = None
         self.documents = []
@@ -65,8 +99,13 @@ class RAGSystem:
             return
         
         try:
-            from ..utils.config import RAG_CONFIG
-            embedding_model = RAG_CONFIG.get("embedding_model", "BAAI/bge-m3")
+            # config 파일에서 설정 읽기
+            embedding_model = "BAAI/bge-m3"
+            try:
+                from utils.config import RAG_CONFIG
+                embedding_model = RAG_CONFIG.get("embedding_model", embedding_model)
+            except:
+                pass
             
             self.embeddings = HuggingFaceEmbeddings(
                 model_name=embedding_model,
@@ -77,9 +116,13 @@ class RAGSystem:
             print(f"⚠️  임베딩 모델 로드 실패: {e}")
             # Fallback
             try:
-                from ..utils.config import RAG_CONFIG
-                fallback_model = RAG_CONFIG.get("fallback_embedding_model", 
-                                                "sentence-transformers/all-MiniLM-L6-v2")
+                fallback_model = "sentence-transformers/all-MiniLM-L6-v2"
+                try:
+                    from utils.config import RAG_CONFIG
+                    fallback_model = RAG_CONFIG.get("fallback_embedding_model", fallback_model)
+                except:
+                    pass
+                
                 self.embeddings = HuggingFaceEmbeddings(model_name=fallback_model)
                 print(f"✅ Fallback 임베딩 모델 로드: {fallback_model}")
             except Exception as e2:
@@ -88,22 +131,40 @@ class RAGSystem:
     
     def _load_knowledge_base(self):
         """지식 베이스 로드 및 벡터화"""
-        if not LANGCHAIN_AVAILABLE or self.embeddings is None:
-            print("⚠️  LangChain 또는 임베딩 모델 없음. 샘플 문서만 사용합니다.")
-            self._load_sample_documents()
-            return
-        
         os.makedirs(self.knowledge_base_path, exist_ok=True)
         
-        # ChromaDB 사용 시도
-        if self.use_chromadb and self.vector_db_path:
+        # 디버깅 정보
+        print(f"🔍 RAG 로딩 설정:")
+        print(f"   - use_chromadb: {self.use_chromadb}")
+        print(f"   - vector_db_path: {self.vector_db_path}")
+        print(f"   - CHROMADB_AVAILABLE: {CHROMADB_AVAILABLE}")
+        
+        # ChromaDB 우선 시도 (LangChain 불필요)
+        if self.use_chromadb and self.vector_db_path and CHROMADB_AVAILABLE:
+            print(f"🔄 ChromaDB 로드 시도 중: {self.vector_db_path}")
             try:
                 self._load_from_chromadb()
                 if self.is_loaded:
+                    print(f"✅ ChromaDB에서 성공적으로 로드됨")
                     return
+                else:
+                    print(f"⚠️  ChromaDB 로드했지만 is_loaded=False")
             except Exception as e:
                 print(f"⚠️  ChromaDB 로드 실패: {e}")
-                print("   FAISS로 전환합니다.")
+                import traceback
+                traceback.print_exc()
+        elif self.use_chromadb:
+            if not CHROMADB_AVAILABLE:
+                print(f"⚠️  ChromaDB가 설치되지 않음 (pip install chromadb)")
+            if not self.vector_db_path:
+                print(f"⚠️  vector_db_path가 None임")
+        
+        # FAISS 사용 시에는 LangChain 필요
+        if not LANGCHAIN_AVAILABLE or self.embeddings is None:
+            print("⚠️  LangChain 없음. ChromaDB 또는 샘플 문서만 사용 가능합니다.")
+            if not self.is_loaded:
+                self._load_sample_documents_simple()
+            return
         
         # 파일에서 로드 시도
         try:
@@ -120,19 +181,83 @@ class RAGSystem:
     def _load_from_chromadb(self):
         """ChromaDB에서 로드"""
         if not CHROMADB_AVAILABLE or not self.vector_db_path:
+            print(f"⚠️  ChromaDB 조건 미충족: AVAILABLE={CHROMADB_AVAILABLE}, path={self.vector_db_path}")
             return
         
         try:
+            # ChromaDB 클라이언트 연결
+            print(f"🔗 ChromaDB 연결 중: {self.vector_db_path}")
             client = chromadb.PersistentClient(
                 path=str(self.vector_db_path),
                 settings=Settings(allow_reset=False)
             )
+            
+            # 컬렉션 존재 확인
+            collections = client.list_collections()
+            collection_names = [c.name for c in collections]
+            print(f"📋 사용 가능한 컬렉션: {collection_names}")
+            
+            if "manufacturing_kb" not in collection_names:
+                print(f"⚠️  'manufacturing_kb' 컬렉션을 찾을 수 없습니다.")
+                print(f"   ChromaDB를 구축하려면: cd 3_knowledge_base && python setup_rag.py")
+                return
+            
+            # 컬렉션 로드
             collection = client.get_collection("manufacturing_kb")
             self.chroma_collection = collection
+            
+            # 컬렉션 정보 확인
+            count = collection.count()
+            print(f"📚 컬렉션 문서 수: {count}개")
+            
+            if count == 0:
+                print(f"⚠️  컬렉션이 비어있습니다.")
+                return
+            
+            # ChromaDB 검색을 위한 임베딩 모델 초기화 (sentence-transformers 직접 사용)
+            try:
+                from sentence_transformers import SentenceTransformer
+                
+                # ChromaDB 구축 시 사용한 모델과 동일해야 함!
+                # setup_rag.py의 EMBEDDING_MODEL_NAME과 일치
+                models_to_try = [
+                    "BAAI/bge-m3",  # 🎯 ChromaDB 구축 시 사용한 모델 (1024차원) - 최우선
+                    "sentence-transformers/all-MiniLM-L6-v2",  # fallback (384차원)
+                    "paraphrase-MiniLM-L6-v2",  # 대안 2
+                ]
+                
+                for embedding_model in models_to_try:
+                    try:
+                        print(f"🔄 임베딩 모델 로드 시도: {embedding_model}")
+                        self.embedding_model = SentenceTransformer(embedding_model)
+                        print(f"✅ ChromaDB용 임베딩 모델 로드 완료: {embedding_model}")
+                        break
+                    except Exception as e:
+                        print(f"⚠️  {embedding_model} 로드 실패: {e}")
+                        continue
+                
+                if self.embedding_model is None:
+                    print(f"⚠️  모든 임베딩 모델 로드 실패. ChromaDB 기본 임베딩 사용")
+                    print(f"   텍스트 쿼리만 가능합니다.")
+                    
+            except ImportError as e:
+                print(f"⚠️  sentence-transformers 미설치: {e}")
+                print(f"   설치: pip install sentence-transformers")
+                print(f"   ChromaDB 기본 임베딩 사용 (텍스트 쿼리만 가능)")
+                self.embedding_model = None
+            except Exception as e:
+                print(f"⚠️  임베딩 모델 초기화 실패: {e}")
+                self.embedding_model = None
+            
+            # 성공
             self.is_loaded = True
-            print(f"✅ ChromaDB에서 지식 베이스 로드 완료")
-        except Exception:
-            pass
+            print(f"✅ ChromaDB에서 지식 베이스 로드 완료 ({count}개 문서)")
+            
+        except Exception as e:
+            print(f"❌ ChromaDB 연결 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            self.is_loaded = False
     
     def _load_from_files(self):
         """파일에서 지식 베이스 로드"""
@@ -154,9 +279,14 @@ class RAGSystem:
         sample_docs = self._create_sample_documents()
         
         # 문서 분할
-        from ..utils.config import RAG_CONFIG
-        chunk_size = RAG_CONFIG.get("chunk_size", 500)
-        chunk_overlap = RAG_CONFIG.get("chunk_overlap", 50)
+        chunk_size = 500
+        chunk_overlap = 50
+        try:
+            from utils.config import RAG_CONFIG
+            chunk_size = RAG_CONFIG.get("chunk_size", chunk_size)
+            chunk_overlap = RAG_CONFIG.get("chunk_overlap", chunk_overlap)
+        except:
+            pass
         
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
@@ -180,6 +310,12 @@ class RAGSystem:
             print(f"✅ 샘플 지식 베이스 로드 완료 ({len(splits)}개 청크)")
         else:
             print("⚠️  지식 베이스 문서 없음")
+    
+    def _load_sample_documents_simple(self):
+        """LangChain 없이 간단한 샘플 문서 로드"""
+        self.documents = self._create_sample_documents()
+        self.is_loaded = True
+        print(f"✅ 샘플 지식 베이스 로드 완료 ({len(self.documents)}개 문서, LangChain 없음)")
     
     def _create_sample_documents(self) -> List[Dict]:
         """샘플 지식 베이스 문서 생성"""
@@ -276,31 +412,49 @@ class RAGSystem:
             검색 결과 리스트
         """
         if k is None:
-            from ..utils.config import RAG_CONFIG
-            k = RAG_CONFIG.get("search_k", 3)
+            k = 3  # 기본값
+            try:
+                from utils.config import RAG_CONFIG
+                k = RAG_CONFIG.get("search_k", k)
+            except:
+                pass
         
         # ChromaDB 사용
         if self.use_chromadb and self.chroma_collection is not None:
             try:
-                results = self.chroma_collection.query(
-                    query_texts=[query],
-                    n_results=k
-                )
+                # 임베딩 생성 후 검색
+                if self.embedding_model is not None:
+                    query_embedding = self.embedding_model.encode([query]).tolist()
+                    results = self.chroma_collection.query(
+                        query_embeddings=query_embedding,
+                        n_results=k
+                    )
+                else:
+                    # 임베딩 모델 없으면 텍스트 직접 사용 (ChromaDB 기본 임베딩)
+                    results = self.chroma_collection.query(
+                        query_texts=[query],
+                        n_results=k
+                    )
                 
                 retrieved = []
                 if results['documents'] and len(results['documents'][0]) > 0:
-                    for i, (doc, metadata) in enumerate(zip(
+                    for i, (doc, metadata, distance) in enumerate(zip(
                         results['documents'][0],
-                        results['metadatas'][0] if results['metadatas'] else [{}] * len(results['documents'][0])
+                        results['metadatas'][0] if results['metadatas'] else [{}] * len(results['documents'][0]),
+                        results['distances'][0] if results.get('distances') else [0] * len(results['documents'][0])
                     )):
+                        # cosine distance를 similarity로 변환 (0=동일, 2=완전반대)
+                        similarity = 1 - (distance / 2) if distance else 0.9 - (i * 0.1)
                         retrieved.append({
                             'content': doc,
                             'metadata': metadata,
-                            'similarity': 0.9 - (i * 0.1)  # 간단한 유사도 추정
+                            'similarity': max(0, min(1, similarity))  # 0~1 범위로 제한
                         })
                 return retrieved
             except Exception as e:
                 print(f"⚠️  ChromaDB 검색 실패: {e}")
+                import traceback
+                traceback.print_exc()
         
         # FAISS 사용
         if self.vectorstore is not None:
@@ -319,6 +473,21 @@ class RAGSystem:
             except Exception as e:
                 print(f"⚠️  FAISS 검색 실패: {e}")
         
-        # 검색 실패 시 빈 리스트 반환
-        print("⚠️  벡터 스토어 없음. 검색 결과 없음")
+        # 벡터 스토어가 없으면 샘플 문서에서 키워드 검색 (폴백)
+        if self.documents:
+            print("⚠️  벡터 검색 불가. 키워드 기반 검색을 시도합니다.")
+            retrieved = []
+            query_lower = query.lower()
+            for doc in self.documents[:k]:
+                content = doc.get('content', '')
+                if any(keyword in content.lower() for keyword in query_lower.split()):
+                    retrieved.append({
+                        'content': content,
+                        'metadata': doc.get('metadata', {}),
+                        'similarity': 0.5  # 키워드 매칭이므로 낮은 유사도
+                    })
+            return retrieved[:k]
+        
+        # 완전 실패
+        print("⚠️  검색 시스템 없음. 검색 결과 없음")
         return []

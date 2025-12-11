@@ -14,10 +14,18 @@ from datetime import datetime, timedelta
 import numpy as np
 import json
 import time
+import sys
+import os
 from typing import Dict, List
 
-# 메인 시스템 import (실제 파일명에 맞게 수정)
-# from main_system import ManufacturingAISystem
+# 메인 시스템 import
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '4_agent_system'))
+try:
+    from main_system import ManufacturingAISystem
+    SYSTEM_AVAILABLE = True
+except Exception as e:
+    print(f"⚠️ AI 시스템 import 실패: {e}")
+    SYSTEM_AVAILABLE = False
 
 
 # ============================================================================
@@ -80,55 +88,61 @@ if 'current_data' not in st.session_state:
 if 'system_initialized' not in st.session_state:
     st.session_state.system_initialized = False
 
+if 'ai_system' not in st.session_state:
+    st.session_state.ai_system = None
+
+if 'last_result' not in st.session_state:
+    st.session_state.last_result = None
+
+
+# ============================================================================
+# AI 시스템 초기화 (캐싱)
+# ============================================================================
+
+@st.cache_resource(show_spinner="AI 시스템 로딩 중... (최초 1회만 실행됩니다)")
+def initialize_ai_system():
+    """AI 시스템 초기화 - 캐싱으로 재사용"""
+    try:
+        if not SYSTEM_AVAILABLE:
+            return None
+        
+        system = ManufacturingAISystem(
+            detection_model_type="ensemble",
+            detection_model_path=None
+        )
+        return system
+    except Exception as e:
+        st.error(f"AI 시스템 초기화 실패: {e}")
+        return None
+
 
 # ============================================================================
 # 시뮬레이션 데이터 생성 함수
 # ============================================================================
 
 def generate_sensor_data(anomaly: bool = False) -> Dict:
-    """센서 데이터 시뮬레이션"""
+    """센서 데이터 시뮬레이션 (Press 형식)"""
     
     if anomaly:
-        # 이상 패턴
-        anomaly_type = np.random.choice(['온도', '압력', '진동', '사이클타임'])
-        
-        if anomaly_type == '온도':
-            temp = np.random.uniform(230, 250)
-            pressure = np.random.uniform(110, 130)
-            vibration = np.random.uniform(0.8, 1.5)
-            cycle_time = np.random.uniform(48, 58)
-        elif anomaly_type == '압력':
-            temp = np.random.uniform(190, 210)
-            pressure = np.random.uniform(70, 90)
-            vibration = np.random.uniform(0.8, 1.5)
-            cycle_time = np.random.uniform(58, 72)
-        elif anomaly_type == '진동':
-            temp = np.random.uniform(190, 210)
-            pressure = np.random.uniform(110, 130)
-            vibration = np.random.uniform(3.0, 5.0)
-            cycle_time = np.random.uniform(48, 58)
-        else:  # 사이클타임
-            temp = np.random.uniform(190, 210)
-            pressure = np.random.uniform(110, 130)
-            vibration = np.random.uniform(0.8, 1.5)
-            cycle_time = np.random.uniform(75, 90)
+        # 이상 패턴 (실제 outlier 데이터 기반)
+        ai0_vib = np.random.uniform(0.8, 1.5)  # 고진동
+        ai1_vib = np.random.uniform(-0.8, -0.3)  # 고진동 (음수)
+        ai2_current = np.random.uniform(230, 250)  # 과전류
     else:
         # 정상 패턴
-        temp = np.random.uniform(195, 205)
-        pressure = np.random.uniform(115, 125)
-        vibration = np.random.uniform(0.8, 1.5)
-        cycle_time = np.random.uniform(48, 52)
+        ai0_vib = np.random.uniform(-0.05, 0.05)  # 정상 진동
+        ai1_vib = np.random.uniform(-0.05, 0.05)  # 정상 진동
+        ai2_current = np.random.uniform(20, 50)  # 정상 전류
     
     return {
-        "temperature": round(temp, 1),
-        "pressure": round(pressure, 1),
-        "vibration": round(vibration, 2),
-        "cycle_time": round(cycle_time, 1)
+        "AI0_Vibration": round(ai0_vib, 4),
+        "AI1_Vibration": round(ai1_vib, 4),
+        "AI2_Current": round(ai2_current, 2)
     }
 
 
 def generate_time_series_data(hours: int = 24, anomaly_at: int = None):
-    """시계열 데이터 생성"""
+    """시계열 데이터 생성 (Press 형식)"""
     
     now = datetime.now()
     times = [now - timedelta(hours=hours-i) for i in range(hours)]
@@ -164,8 +178,8 @@ with st.sidebar:
     # 설비 선택
     equipment_id = st.selectbox(
         "설비 선택",
-        ["사출기-1호기", "사출기-2호기", "사출기-3호기", 
-         "프레스-1호기", "CNC-1호기"]
+        ["PRESS-01", "PRESS-02", "PRESS-03", 
+         "사출기-1호기", "사출기-2호기"]
     )
     
     st.divider()
@@ -181,26 +195,61 @@ with st.sidebar:
     st.divider()
     
     # 알림 설정
-    st.subheader("🔔 알림 설정")
-    alert_temp = st.slider("온도 임계값 (°C)", 210, 240, 225)
-    alert_pressure = st.slider("압력 임계값 (bar)", 90, 110, 100)
-    alert_vibration = st.slider("진동 임계값 (mm/s)", 2.0, 3.5, 2.5)
+    st.subheader("🔔 알림 설정 (Press)")
+    alert_vib_warning = st.slider("진동 주의 임계값 (g)", 0.10, 0.25, 0.15, 0.01)
+    alert_vib_danger = st.slider("진동 위험 임계값 (g)", 0.25, 0.50, 0.30, 0.01)
+    alert_current = st.slider("전류 임계값 (A)", 200, 250, 230, 5)
     
     st.divider()
     
     # 시스템 상태
     st.subheader("🖥️ 시스템 상태")
     
-    if st.button("🔄 시스템 초기화", use_container_width=True):
-        with st.spinner("시스템 초기화 중..."):
-            time.sleep(2)
-            st.session_state.system_initialized = True
-            st.success("✅ 초기화 완료!")
+    # 자동 초기화 옵션
+    auto_init = st.checkbox("자동 초기화 (페이지 로드 시)", value=True)
     
-    if st.session_state.system_initialized:
-        st.success("✅ 시스템 작동 중")
+    if auto_init and not st.session_state.system_initialized:
+        with st.spinner("AI 시스템 자동 초기화 중..."):
+            st.session_state.ai_system = initialize_ai_system()
+            if st.session_state.ai_system:
+                st.session_state.system_initialized = True
+    
+    if st.button("🔄 AI 시스템 초기화/재시작", use_container_width=True):
+        if not SYSTEM_AVAILABLE:
+            st.error("❌ AI 시스템을 불러올 수 없습니다.")
+        else:
+            # 캐시 클리어 후 재초기화
+            initialize_ai_system.clear()
+            st.session_state.ai_system = initialize_ai_system()
+            if st.session_state.ai_system:
+                st.session_state.system_initialized = True
+                st.success("✅ AI 시스템 재시작 완료!")
+            else:
+                st.error("❌ 초기화 실패")
+    
+    if st.session_state.system_initialized and st.session_state.ai_system:
+        st.success("✅ AI 시스템 작동 중")
+        st.caption("🤖 Detection + Retrieval + Action + PM + Report")
+        st.caption("💾 모델 캐싱 활성화 (빠른 실행)")
+    elif SYSTEM_AVAILABLE:
+        st.warning("⚠️ AI 시스템 초기화 필요")
     else:
-        st.warning("⚠️ 시스템 초기화 필요")
+        st.error("❌ AI 시스템 불가용")
+    
+    # 실행 이력
+    if st.session_state.history:
+        st.divider()
+        st.subheader("📊 실행 이력")
+        st.caption(f"총 {len(st.session_state.history)}건 분석")
+        
+        # 최근 5건만 표시
+        for i, record in enumerate(reversed(st.session_state.history[-5:])):
+            with st.expander(f"#{len(st.session_state.history)-i} - {record['timestamp'].strftime('%H:%M:%S')}"):
+                st.write(f"**설비:** {record['equipment_id']}")
+                st.write(f"**이상 여부:** {'🚨 이상' if record['result'].get('is_anomaly') else '✅ 정상'}")
+                if record['result'].get('is_anomaly'):
+                    st.write(f"**이상 유형:** {record['result'].get('anomaly_type')}")
+                    st.write(f"**신뢰도:** {record['result'].get('anomaly_score', 0):.1%}")
 
 
 # ============================================================================
@@ -212,88 +261,106 @@ if monitoring_mode == "실시간 모니터링":
     # ========== 현재 상태 대시보드 ==========
     st.header("📈 실시간 센서 모니터링")
     
-    # 센서 데이터 생성 (시뮬레이션)
-    if st.button("🔄 데이터 새로고침", use_container_width=True):
-        sensor_data = generate_sensor_data(anomaly=np.random.random() < 0.3)
-        st.session_state.current_data = sensor_data
+    # 데이터 입력 방법 선택
+    data_input_mode = st.radio(
+        "데이터 입력 방법",
+        ["시뮬레이션 (랜덤)", "수동 입력", "이상 데이터 생성"],
+        horizontal=True
+    )
     
-    if st.session_state.current_data is None:
-        st.session_state.current_data = generate_sensor_data()
+    if data_input_mode == "시뮬레이션 (랜덤)":
+        if st.button("🔄 데이터 새로고침", use_container_width=True):
+            sensor_data = generate_sensor_data(anomaly=np.random.random() < 0.3)
+            st.session_state.current_data = sensor_data
+        
+        if st.session_state.current_data is None:
+            st.session_state.current_data = generate_sensor_data()
+    
+    elif data_input_mode == "수동 입력":
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            ai0 = st.number_input("AI0_Vibration (g)", -2.0, 2.0, 0.02, 0.01, format="%.4f")
+        with col2:
+            ai1 = st.number_input("AI1_Vibration (g)", -2.0, 2.0, -0.01, 0.01, format="%.4f")
+        with col3:
+            ai2 = st.number_input("AI2_Current (A)", 0.0, 300.0, 35.0, 1.0, format="%.2f")
+        
+        st.session_state.current_data = {
+            "AI0_Vibration": ai0,
+            "AI1_Vibration": ai1,
+            "AI2_Current": ai2
+        }
+    
+    else:  # 이상 데이터 생성
+        if st.button("⚠️ 이상 데이터 생성", use_container_width=True):
+            sensor_data = generate_sensor_data(anomaly=True)
+            st.session_state.current_data = sensor_data
+        
+        if st.session_state.current_data is None:
+            st.session_state.current_data = generate_sensor_data(anomaly=True)
     
     sensor_data = st.session_state.current_data
     
-    # 센서 값 표시 (4개 컬럼)
-    col1, col2, col3, col4 = st.columns(4)
+    # 센서 값 표시 (3개 컬럼 - Press 센서)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        temp = sensor_data['temperature']
-        temp_status = "🔴 이상" if temp > alert_temp else "🟢 정상"
+        ai0_vib = sensor_data['AI0_Vibration']
+        ai0_status = "🔴 이상" if abs(ai0_vib) > 0.3 else ("🟡 주의" if abs(ai0_vib) > 0.15 else "🟢 정상")
         st.metric(
-            label="🌡️ 온도",
-            value=f"{temp}°C",
-            delta=f"{temp - 200:.1f}°C",
+            label="📳 AI0_Vibration",
+            value=f"{ai0_vib:.4f} g",
+            delta=f"{abs(ai0_vib) - 0.02:.4f} g" if ai0_vib != 0 else "0.0000 g",
             delta_color="inverse"
         )
-        st.caption(temp_status)
+        st.caption(f"{ai0_status} (정상: ±0.15g, 위험: ±0.30g)")
     
     with col2:
-        pressure = sensor_data['pressure']
-        pressure_status = "🔴 이상" if pressure < alert_pressure else "🟢 정상"
+        ai1_vib = sensor_data['AI1_Vibration']
+        ai1_status = "🔴 이상" if abs(ai1_vib) > 0.3 else ("🟡 주의" if abs(ai1_vib) > 0.15 else "🟢 정상")
         st.metric(
-            label="💨 압력",
-            value=f"{pressure} bar",
-            delta=f"{pressure - 120:.1f} bar",
+            label="📳 AI1_Vibration",
+            value=f"{ai1_vib:.4f} g",
+            delta=f"{abs(ai1_vib) - 0.02:.4f} g" if ai1_vib != 0 else "0.0000 g",
             delta_color="inverse"
         )
-        st.caption(pressure_status)
+        st.caption(f"{ai1_status} (정상: ±0.15g, 위험: ±0.30g)")
     
     with col3:
-        vibration = sensor_data['vibration']
-        vib_status = "🔴 이상" if vibration > alert_vibration else "🟢 정상"
+        ai2_current = sensor_data['AI2_Current']
+        ai2_status = "🔴 이상" if ai2_current > 230 else "🟢 정상"
         st.metric(
-            label="📳 진동",
-            value=f"{vibration} mm/s",
-            delta=f"{vibration - 1.0:.2f} mm/s",
+            label="⚡ AI2_Current",
+            value=f"{ai2_current:.2f} A",
+            delta=f"{ai2_current - 35:.2f} A",
             delta_color="inverse"
         )
-        st.caption(vib_status)
-    
-    with col4:
-        cycle_time = sensor_data['cycle_time']
-        cycle_status = "🔴 이상" if cycle_time > 65 else "🟢 정상"
-        st.metric(
-            label="⏱️ 사이클 타임",
-            value=f"{cycle_time} 초",
-            delta=f"{cycle_time - 50:.1f} 초",
-            delta_color="inverse"
-        )
-        st.caption(cycle_status)
+        st.caption(f"{ai2_status} (정상: ~35A, 위험: >230A)")
     
     st.divider()
     
     # ========== 이상 탐지 결과 ==========
     st.header("🔍 AI 이상 탐지 결과")
     
-    # 이상 여부 판단
+    # 이상 여부 판단 (Press 기준)
     is_anomaly = (
-        temp > alert_temp or 
-        pressure < alert_pressure or 
-        vibration > alert_vibration or
-        cycle_time > 65
+        abs(ai0_vib) > 0.3 or 
+        abs(ai1_vib) > 0.3 or 
+        ai2_current > 230
     )
     
     if is_anomaly:
         st.error("🚨 **이상 감지!**")
         
         # 이상 유형 판단
-        if temp > alert_temp:
-            anomaly_type = "온도 이상"
-        elif pressure < alert_pressure:
-            anomaly_type = "압력 이상"
-        elif vibration > alert_vibration:
-            anomaly_type = "진동 이상"
+        if abs(ai0_vib) > 0.3 and abs(ai1_vib) > 0.3:
+            anomaly_type = "고진동+전류 이상" if ai2_current > 230 else "고진동 이상"
+        elif abs(ai0_vib) > 0.3:
+            anomaly_type = "AI0 진동 이상"
+        elif abs(ai1_vib) > 0.3:
+            anomaly_type = "AI1 진동 이상"
         else:
-            anomaly_type = "사이클타임 지연"
+            anomaly_type = "전류 이상"
         
         col1, col2 = st.columns(2)
         
@@ -313,197 +380,201 @@ if monitoring_mode == "실시간 모니터링":
         st.divider()
         
         # ========== AI Agent 분석 실행 ==========
-        if st.button("🤖 AI Agent 분석 실행", type="primary", use_container_width=True):
-            
-            with st.spinner("AI Agent가 분석 중입니다..."):
-                
+        col_btn1, col_btn2 = st.columns([3, 1])
+        
+        with col_btn1:
+            run_analysis = st.button("🤖 AI Agent 분석 실행", type="primary", use_container_width=True)
+        
+        with col_btn2:
+            show_detail = st.checkbox("상세 로그", value=False)
+        
+        if run_analysis:
+            # AI 시스템 초기화 확인
+            if not st.session_state.system_initialized or not st.session_state.ai_system:
+                st.error("❌ AI 시스템을 먼저 초기화해주세요! (왼쪽 사이드바에서 자동 초기화 활성화)")
+            else:
                 # Progress bar
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
-                # Detection
-                status_text.text("🔍 Detection Agent: 이상 탐지 중...")
-                time.sleep(0.5)
-                progress_bar.progress(20)
-                
-                # Retrieval
-                status_text.text("📖 Retrieval Agent: 유사 사례 검색 중...")
-                time.sleep(1.0)
-                progress_bar.progress(40)
-                
-                # Action
-                status_text.text("🔧 Action Agent: 조치 가이드 생성 중... (LoRA)")
-                time.sleep(1.5)
-                progress_bar.progress(60)
-                
-                # PM
-                status_text.text("🛠️ PM Agent: 예방보전 분석 중...")
-                time.sleep(0.8)
-                progress_bar.progress(80)
-                
-                # Report
-                status_text.text("📄 Report Agent: 8D Report 생성 중... (LoRA)")
-                time.sleep(1.2)
-                progress_bar.progress(100)
-                
-                status_text.text("✅ 분석 완료!")
-                time.sleep(0.5)
-            
-            st.success("🎉 AI Agent 분석이 완료되었습니다!")
+                try:
+                    # 실제 AI 시스템 실행
+                    status_text.text("🔍 Detection Agent 실행 중...")
+                    progress_bar.progress(20)
+                    
+                    result = st.session_state.ai_system.process_anomaly_event(
+                        equipment_id=equipment_id,
+                        sensor_data=sensor_data
+                    )
+                    
+                    # 결과 저장
+                    st.session_state.last_result = result
+                    st.session_state.history.append({
+                        'timestamp': datetime.now(),
+                        'equipment_id': equipment_id,
+                        'result': result
+                    })
+                    
+                    progress_bar.progress(100)
+                    status_text.text("✅ 전체 분석 완료!")
+                    time.sleep(0.3)
+                    status_text.empty()
+                    progress_bar.empty()
+                    
+                    # 성공 메시지
+                    st.success("🎉 AI Agent 분석이 완료되었습니다!")
+                    
+                    # 소요 시간 표시
+                    elapsed = result.get('elapsed_time', 0)
+                    st.info(f"⏱️ 소요 시간: {elapsed:.2f}초")
+                    
+                except Exception as e:
+                    progress_bar.progress(100)
+                    status_text.text(f"❌ 오류 발생")
+                    st.error(f"AI 시스템 실행 중 오류가 발생했습니다: {e}")
+                    
+                    if show_detail:
+                        import traceback
+                        with st.expander("상세 에러 로그"):
+                            st.code(traceback.format_exc())
+                    
+                    st.session_state.last_result = None
             
             # ========== 분석 결과 표시 ==========
-            st.divider()
-            st.header("📋 AI Agent 분석 결과")
-            
-            # 탭으로 구분
-            tab1, tab2, tab3, tab4, tab5 = st.tabs([
-                "🔍 이상 탐지", 
-                "📖 유사 사례", 
-                "🔧 조치 가이드", 
-                "🛠️ 예방보전",
-                "📄 8D Report"
-            ])
-            
-            with tab1:
-                st.markdown("### 🔍 Detection Agent 결과")
-                col1, col2 = st.columns(2)
+            if st.session_state.last_result:
+                st.divider()
+                st.header("📋 AI Agent 분석 결과")
                 
-                with col1:
-                    st.metric("이상 여부", "이상 감지", delta="위험")
-                    st.metric("이상 유형", anomaly_type)
+                result = st.session_state.last_result
                 
-                with col2:
-                    st.metric("신뢰도", "87.5%")
-                    st.metric("발생 시각", datetime.now().strftime("%H:%M:%S"))
-            
-            with tab2:
-                st.markdown("### 📖 Retrieval Agent 결과")
-                st.markdown("**검색된 유사 사례 (RAG)**")
+                # 탭으로 구분
+                tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                    "🔍 이상 탐지", 
+                    "📖 유사 사례", 
+                    "🔧 조치 가이드", 
+                    "🛠️ 예방보전",
+                    "📄 8D Report"
+                ])
                 
-                st.info("""
-                **[과거 이력 #2023-08-15]** (유사도: 92%)
-                - 설비: 사출기-2호기
-                - 증상: 실린더 온도 급상승 (235°C)
-                - 원인: 히터 코일 단선
-                - 조치: 히터 교체 후 정상화
-                - 소요시간: 4시간
-                """)
+                with tab1:
+                    st.markdown("### 🔍 Detection Agent 결과")
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        is_anom = result.get('is_anomaly', False)
+                        st.metric("이상 여부", "이상 감지" if is_anom else "정상", 
+                                 delta="위험" if is_anom else "정상")
+                        st.metric("이상 유형", result.get('anomaly_type', 'N/A'))
+                    
+                    with col2:
+                        score = result.get('anomaly_score', 0)
+                        st.metric("신뢰도", f"{score:.1%}")
+                        st.metric("발생 시각", result.get('timestamp', 'N/A'))
                 
-                st.info("""
-                **[설비 매뉴얼 3.2절]** (유사도: 88%)
-                - 실린더 온도가 설정값 ±15°C를 벗어날 경우
-                - 히터 저항값 측정 (정상: 30~35Ω)
-                - 열전대 센서 점검 필요
-                """)
-            
-            with tab3:
-                st.markdown("### 🔧 Action Agent 결과 (LoRA 모델)")
+                with tab2:
+                    st.markdown("### 📖 Retrieval Agent 결과")
+                    st.markdown("**검색된 유사 사례 (RAG + ChromaDB)**")
+                    
+                    similar_cases = result.get('similar_cases', [])
+                    
+                    if similar_cases:
+                        for i, case in enumerate(similar_cases, 1):
+                            content = case.get('content', '')
+                            metadata = case.get('metadata', {})
+                            similarity = case.get('similarity', 0)
+                            
+                            st.info(f"""
+                            **[검색 결과 #{i}]** (유사도: {similarity:.1%})
+                            
+                            {content[:500]}...
+                            
+                            *출처: {metadata.get('source_file', 'N/A')}*
+                            *카테고리: {metadata.get('category', 'N/A')}*
+                            """)
+                    else:
+                        st.warning("검색된 유사 사례가 없습니다.")
                 
-                st.markdown("#### 🧠 상황 분석 및 추론 과정 (CoT)")
-                st.write("""
-                **1단계: 데이터 이상 징후 확인**
-                - 실린더 온도 235°C (정상 200°C 대비 +35°C, 17.5% 변동)
-                - 설정 임계값(±15°C)을 명확히 초과
-                - 패턴: 전형적인 **온도 이상** 징후
+                with tab3:
+                    st.markdown("### 🔧 Action Agent 결과 (LoRA 모델)")
+                    
+                    # CoT 추론 과정
+                    cot_reasoning = result.get('cot_reasoning', '')
+                    if cot_reasoning:
+                        st.markdown("#### 🧠 상황 분석 및 추론 과정 (CoT)")
+                        st.write(cot_reasoning)
+                    
+                    # 원인 분석
+                    root_causes = result.get('root_causes', [])
+                    if root_causes:
+                        st.markdown("#### ✅ 원인 분석 (우선순위)")
+                        for i, cause in enumerate(root_causes, 1):
+                            if i == 1:
+                                st.success(f"**{i}순위:** {cause}")
+                            elif i == 2:
+                                st.warning(f"**{i}순위:** {cause}")
+                            else:
+                                st.info(f"**{i}순위:** {cause}")
+                    
+                    # 체크리스트
+                    checklist = result.get('checklist', [])
+                    if checklist:
+                        st.markdown("#### 📝 우선 점검 체크리스트")
+                        for i, item in enumerate(checklist):
+                            st.checkbox(item, key=f"check_{i}_{item[:20]}")
                 
-                **2단계: 근거 자료 교차 검증**
-                - RAG 시스템 검색 결과와 **92% 일치**
-                - 과거 이력에서 동일한 센서 패턴 확인
+                with tab4:
+                    st.markdown("### 🛠️ PM Recommendation Agent 결과")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        health_score = result.get('health_score', 0)
+                        st.metric("Health Score", f"{health_score:.1%}", 
+                                 delta=f"{health_score - 1.0:.1%}", delta_color="inverse")
+                        
+                        failure_risk = result.get('failure_risk', 0)
+                        st.metric("고장 위험도", f"{failure_risk:.1%}", 
+                                 delta=f"{failure_risk:.1%}", delta_color="inverse")
+                    
+                    with col2:
+                        recovery_time = result.get('estimated_recovery_time', 'N/A')
+                        st.metric("예상 복구 시간", recovery_time)
+                        
+                        urgency = result.get('urgency_level', 'N/A')
+                        st.metric("긴급도", urgency)
+                    
+                    # PM 추천사항
+                    pm_recommendations = result.get('pm_recommendations', [])
+                    if pm_recommendations:
+                        st.markdown("#### 📋 PM 추천사항")
+                        for rec in pm_recommendations:
+                            if 'HIGH' in str(rec) or '긴급' in str(rec):
+                                st.error(rec)
+                            elif 'MEDIUM' in str(rec) or '주의' in str(rec):
+                                st.warning(rec)
+                            else:
+                                st.info(rec)
                 
-                **3단계: 물리적 인과관계 분석**
-                - 예상 현상: 열전달 효율 저하
-                - 히터 고장의 전형적인 증상과 일치
-                
-                **4단계: 최종 결론**
-                → 근본 원인: **히터 고장 또는 성능 저하**
-                → 확률: **높음 (85% 이상)**
-                """)
-                
-                st.markdown("#### ✅ 원인 분석 (우선순위)")
-                st.success("**1순위: 히터 고장 또는 성능 저하** (확률 85%)")
-                st.warning("**2순위: 온도 센서 오류** (확률 30%)")
-                st.info("**3순위: 냉각 시스템 막힘** (확률 15%)")
-                
-                st.markdown("#### 📝 우선 점검 체크리스트")
-                checklist = [
-                    "경보 이력 및 트렌드 데이터 확인",
-                    "육안 점검 (누유, 균열, 변색)",
-                    "히터 저항값 측정 (정상: 30~35Ω)",
-                    "열전대 센서 점검",
-                    "온도 제어기 파라미터 확인"
-                ]
-                for item in checklist:
-                    st.checkbox(item, key=f"check_{item}")
-            
-            with tab4:
-                st.markdown("### 🛠️ PM Recommendation Agent 결과")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.metric("Health Score", "55%", delta="-30%", delta_color="inverse")
-                    st.metric("고장 위험도", "65%", delta="+40%", delta_color="inverse")
-                
-                with col2:
-                    st.metric("예상 복구 시간", "4~6시간")
-                    st.metric("권장 조치", "48시간 내 긴급 점검")
-                
-                st.markdown("#### 📋 PM 추천사항")
-                st.error("""
-                **[HIGH] 48시간 내 긴급 점검 필요**
-                - 히터 교체 검토
-                - 온도 제어 시스템 전면 점검
-                - 전문가 진단 요청
-                - 예상 소요 시간: 4~6시간
-                """)
-            
-            with tab5:
-                st.markdown("### 📄 8D Report Agent 결과 (LoRA 모델)")
-                
-                report = f"""
-**D1. 팀 구성**
-- 대상 설비: {equipment_id}
-- 담당 부서: 생산기술팀, 품질팀, 설비보전팀
-- 발생 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-**D2. 문제 정의**
-- 현상: {anomaly_type} 발생으로 정상 가동 불가
-- 영향 범위: 생산 중단, 품질 이슈 발생 가능
-- 긴급도: 높음
-
-**D3. 임시 조치 (ICA)**
-- 설비 즉시 정지 및 안전 조치 완료
-- 생산 중 제품 격리 및 검사 대기
-- 대체 설비로 생산 전환
-
-**D4. 근본 원인 분석 (RCA)**
-- 추정 원인: 히터 고장 또는 성능 저하
-- 분석 근거: 센서 데이터 분석, RAG 과거 이력 검토
-- 확률: 85% 이상
-
-**D5. 영구 대책 (PCA)**
-- 히터 교체 및 예비품 확보
-- 예방보전(PM) 주기 재설정
-- 온도 모니터링 시스템 강화
-
-**D6. 대책 실행 및 검증**
-- 조치 완료 후 48시간 연속 모니터링
-- 성능 테스트 및 품질 검증
-
-**D7. 재발 방지**
-- 정기 점검 항목에 히터 저항값 측정 추가
-- 작업 표준서(SOP) 개정
-- 전 직원 교육 실시
-                """
-                
-                st.code(report, language="markdown")
-                
-                st.download_button(
-                    label="📥 8D Report 다운로드",
-                    data=report,
-                    file_name=f"8D_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain"
-                )
+                with tab5:
+                    st.markdown("### 📄 8D Report Agent 결과 (LoRA 모델)")
+                    
+                    report_8d = result.get('report_8d', '')
+                    
+                    if report_8d:
+                        # 8D Report 표시
+                        st.markdown(report_8d)
+                        
+                        # 다운로드 버튼
+                        st.download_button(
+                            label="📥 8D Report 다운로드",
+                            data=report_8d,
+                            file_name=f"8D_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                            mime="text/plain",
+                            use_container_width=True
+                        )
+                    else:
+                        st.warning("8D Report가 생성되지 않았습니다. (LoRA 모델이 필요합니다)")
+                        st.info("8D Report 생성을 위해서는 LoRA 모델이 필요합니다.")
     
     else:
         st.success("✅ **정상 운전 중**")
@@ -539,42 +610,46 @@ elif monitoring_mode == "시뮬레이션":
 
 elif monitoring_mode == "이력 분석":
     
-    st.header("📊 이력 데이터 분석")
+    st.header("📊 이력 데이터 분석 (Press)")
     
     # 시계열 데이터 생성
     df = generate_time_series_data(hours=24, anomaly_at=18)
     
-    # 온도 차트
-    fig_temp = go.Figure()
-    fig_temp.add_trace(go.Scatter(
+    # AI0 진동 차트
+    fig_ai0 = go.Figure()
+    fig_ai0.add_trace(go.Scatter(
         x=df['timestamp'],
-        y=df['temperature'],
+        y=df['AI0_Vibration'],
         mode='lines+markers',
-        name='온도',
-        line=dict(color='red', width=2)
+        name='AI0_Vibration',
+        line=dict(color='blue', width=2)
     ))
-    fig_temp.add_hline(y=alert_temp, line_dash="dash", line_color="orange",
-                       annotation_text="임계값")
-    fig_temp.update_layout(
-        title="온도 추이 (24시간)",
+    fig_ai0.add_hline(y=alert_vib_warning, line_dash="dash", line_color="orange",
+                      annotation_text="주의 임계값")
+    fig_ai0.add_hline(y=alert_vib_danger, line_dash="dash", line_color="red",
+                      annotation_text="위험 임계값")
+    fig_ai0.add_hline(y=-alert_vib_warning, line_dash="dash", line_color="orange")
+    fig_ai0.add_hline(y=-alert_vib_danger, line_dash="dash", line_color="red")
+    fig_ai0.update_layout(
+        title="AI0 진동 추이 (24시간)",
         xaxis_title="시간",
-        yaxis_title="온도 (°C)",
+        yaxis_title="진동 (g)",
         height=400
     )
-    st.plotly_chart(fig_temp, use_container_width=True)
+    st.plotly_chart(fig_ai0, use_container_width=True)
     
     # 기타 센서 차트
     col1, col2 = st.columns(2)
     
     with col1:
-        fig_pressure = px.line(df, x='timestamp', y='pressure', 
-                               title='압력 추이')
-        st.plotly_chart(fig_pressure, use_container_width=True)
+        fig_ai1 = px.line(df, x='timestamp', y='AI1_Vibration', 
+                          title='AI1 진동 추이')
+        st.plotly_chart(fig_ai1, use_container_width=True)
     
     with col2:
-        fig_vibration = px.line(df, x='timestamp', y='vibration',
-                                title='진동 추이')
-        st.plotly_chart(fig_vibration, use_container_width=True)
+        fig_current = px.line(df, x='timestamp', y='AI2_Current',
+                              title='전류 추이 (A)')
+        st.plotly_chart(fig_current, use_container_width=True)
 
 
 # ============================================================================
@@ -582,9 +657,36 @@ elif monitoring_mode == "이력 분석":
 # ============================================================================
 
 st.divider()
+
+# 성능 정보
+with st.expander("💡 성능 최적화 팁"):
+    st.markdown("""
+    ### ⚡ 빠른 실행을 위한 팁
+    
+    1. **자동 초기화 활성화** (왼쪽 사이드바)
+       - 페이지 로드 시 자동으로 모델 로드
+       - 한 번만 로드되고 캐싱됨
+    
+    2. **모델 캐싱**
+       - AI 시스템은 `@st.cache_resource`로 캐싱
+       - 두 번째 실행부터는 매우 빠름 (모델 재로드 X)
+    
+    3. **예상 소요 시간**
+       - 최초 초기화: 30초~1분 (LoRA 모델 로딩)
+       - 이후 분석 실행: 10~30초 (캐싱 후)
+    
+    4. **브라우저 새로고침 시**
+       - Streamlit 서버가 유지되면 캐시 유지
+       - 완전히 재시작하려면 "AI 시스템 초기화/재시작" 클릭
+    
+    5. **메모리 부족 시**
+       - ChromaDB만 사용 (FAISS 비활성화)
+       - LoRA 모델 대신 Base 모델 사용
+    """)
+
 st.markdown("""
 <div style='text-align: center; color: gray;'>
-    <p>🏭 AI 자율 운영 공정 시스템 v2.0</p>
+    <p>🏭 AI 자율 운영 공정 시스템 v2.0 (최적화)</p>
     <p>Team Autonomy | 스마트 제조 AI Agent 해커톤 2025</p>
 </div>
 """, unsafe_allow_html=True)

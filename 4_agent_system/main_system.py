@@ -2,7 +2,7 @@
 4_agent_system/main_system.py
 AI 자율 운영 공정 시스템 - 메인 실행 파일
 
-수정 사항: Import 경로 수정
+수정 사항: Press 데이터 기반, 경로 자동 탐지
 """
 
 import os
@@ -41,21 +41,26 @@ class ManufacturingAISystem:
     """전체 Multi-Agent 시스템 오케스트레이터"""
     
     def __init__(self,
-                 detection_model_type: str = "TimesNet",  # "TimesNet", "rule_based"
+                 detection_model_type: str = "ensemble",  # "TimesNet", "AnomalyTransformer", "ensemble", "rule_based"
+                 detection_model_path: str = None,  # 학습된 모델 경로 (None=자동 탐지)
                  lora_model_path: str = None,
                  knowledge_base_path: str = None):
         """
         Args:
-            detection_model_type: 'TimesNet', 'AnomalyTransformer', 'TranAD', 'rule_based'
-            lora_model_path: LoRA 모델 경로
-            knowledge_base_path: RAG 지식 베이스 경로
+            detection_model_type: 'TimesNet', 'AnomalyTransformer', 'ensemble', 'rule_based'
+            detection_model_path: 학습된 이상 탐지 모델 경로 (None이면 자동 탐지)
+            lora_model_path: LoRA 모델 경로 (None이면 자동 탐지)
+            knowledge_base_path: RAG 지식 베이스 경로 (None이면 자동 탐지)
         """
         
         print("=" * 80)
         print("🏭 AI 자율 운영 공정 시스템 초기화")
         print("=" * 80)
         
-        # 기본 경로 설정 (config 사용)
+        # 프로젝트 루트 자동 탐지
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
+        # 기본 경로 설정 (config 우선, 없으면 자동 탐지)
         try:
             from utils.config import LORA_MODEL_PATH, KNOWLEDGE_BASE_PATH
             if lora_model_path is None:
@@ -63,12 +68,29 @@ class ManufacturingAISystem:
             if knowledge_base_path is None:
                 knowledge_base_path = str(KNOWLEDGE_BASE_PATH)
         except ImportError:
-            # config 없을 때 폴백
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            # config 없을 때 자동 탐지
             if lora_model_path is None:
                 lora_model_path = os.path.join(project_root, "2_model_training", "manufacturing_lora_output")
             if knowledge_base_path is None:
                 knowledge_base_path = os.path.join(project_root, "3_knowledge_base", "knowledge_base")
+        
+        # Detection 모델 경로 자동 탐지
+        if detection_model_path is None:
+            # 모델 타입에 따라 자동 선택
+            if detection_model_type == "ensemble":
+                detection_model_path = os.path.join(project_root, "2_model_training", "best_ensemble_2models.pkl")
+            elif detection_model_type == "TimesNet":
+                detection_model_path = os.path.join(project_root, "2_model_training", "best_timesnet.pkl")
+            elif detection_model_type == "AnomalyTransformer":
+                detection_model_path = os.path.join(project_root, "2_model_training", "best_anomalytransformer.pkl")
+            else:
+                # rule_based는 경로 불필요
+                detection_model_path = None
+        
+        print(f"📁 경로 설정:")
+        print(f"   - Detection 모델: {detection_model_path}")
+        print(f"   - LoRA 모델: {lora_model_path}")
+        print(f"   - 지식 베이스: {knowledge_base_path}")
         
         # LoRA 엔진 초기화
         try:
@@ -81,14 +103,13 @@ class ManufacturingAISystem:
         except Exception as e:
             print(f"⚠️  LoRA 모델 로드 실패: {e}")
             print("   Base 모델만 사용합니다.")
-            import traceback
-            traceback.print_exc()
             self.lora_engine = None
         
         # Agents 초기화
         try:
             self.detection_agent = DetectionAgent(
                 model_type=detection_model_type,
+                model_path=detection_model_path,
                 seq_len=50
             )
         except Exception as e:
@@ -160,6 +181,9 @@ class ManufacturingAISystem:
         Args:
             equipment_id: 설비 ID
             sensor_data: 센서 데이터 딕셔너리
+                - AI0_Vibration: 진동 센서 1 (g)
+                - AI1_Vibration: 진동 센서 2 (g)
+                - AI2_Current: 전류 센서 (A)
         
         Returns:
             처리 결과 딕셔너리
@@ -170,7 +194,10 @@ class ManufacturingAISystem:
         print(f"{'='*80}")
         print(f"설비: {equipment_id}")
         print(f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"센서: {sensor_data}")
+        print(f"센서 데이터:")
+        print(f"  - AI0_Vibration: {sensor_data.get('AI0_Vibration', 0):.4f} g")
+        print(f"  - AI1_Vibration: {sensor_data.get('AI1_Vibration', 0):.4f} g")
+        print(f"  - AI2_Current: {sensor_data.get('AI2_Current', 0):.2f} A")
         
         # 초기 상태 구성
         initial_state = {
@@ -251,59 +278,93 @@ class ManufacturingAISystem:
 def main():
     """메인 실행 함수"""
     
-    # 시스템 초기화 (규칙 기반으로 빠른 테스트)
-    system = ManufacturingAISystem(
-        detection_model_type="rule_based"  # 빠른 테스트용
-    )
-    
-    # 테스트 시나리오 1: 온도 이상
     print("\n" + "=" * 80)
-    print("테스트 시나리오 1: 온도 이상")
+    print("🏭 AI 자율 운영 공정 시스템 - Press 이상 탐지 데모")
     print("=" * 80)
     
+    # 시스템 초기화
+    system = ManufacturingAISystem(
+        detection_model_type="ensemble",  # TimesNet + AnomalyTransformer 앙상블
+        detection_model_path=None  # 자동으로 best_ensemble_2models.pkl 탐지
+    )
+    
+    # 테스트 시나리오 1: 프레스 고진동 + 과전류 이상
+    print("\n" + "=" * 80)
+    print("테스트 시나리오 1: 프레스 고진동 + 과전류 이상")
+    print("=" * 80)
+    print("📝 설명: 실제 이상 데이터 기반 (dataset_3/outlier_data.csv)")
+    print("   - AI0_Vibration 1.07g: 정상 범위(±0.15g) 대비 7배 초과")
+    print("   - AI1_Vibration -0.56g: 정상 범위 대비 3.7배 초과")
+    print("   - AI2_Current 243A: 정상 범위(±230A) 약간 초과")
+
     result1 = system.process_anomaly_event(
-        equipment_id="사출기-2호기",
+        equipment_id="PRESS-01",
         sensor_data={
-            "temperature": 235.5,
-            "pressure": 120.0,
-            "vibration": 1.2,
-            "cycle_time": 52
+            "AI0_Vibration": 1.07,    # g (이상: 정상 ±0.15, 위험 ±0.30 이상)
+            "AI1_Vibration": -0.56,   # g (이상)
+            "AI2_Current": 243.30     # A (이상: 정상 ±230)
         }
     )
+    
+    # 결과 출력
+    print("\n" + "=" * 80)
+    print("📄 생성된 8D Report (미리보기)")
+    print("=" * 80)
+    if result1.get('report_8d'):
+        print(result1.get('report_8d'))
+        print("\n... (이하 생략) ...")
+    else:
+        print("⚠️  8D Report가 생성되지 않았습니다. (LoRA 모델 필요)")
+
+
+    # 테스트 시나리오 2: 프레스 정상 운전
+    print("\n\n" + "=" * 80)
+    print("테스트 시나리오 2: 프레스 정상 운전")
+    print("=" * 80)
+    print("📝 설명: 정상 데이터 기반 (dataset_3/press_data_normal.csv)")
+    print("   - 모든 센서 값이 정상 범위 내")
+
+    result2 = system.process_anomaly_event(
+        equipment_id="PRESS-02",
+        sensor_data={
+            "AI0_Vibration": 0.02,    # g (정상 범위)
+            "AI1_Vibration": -0.01,   # g (정상 범위)
+            "AI2_Current": 35.00      # A (정상 범위)
+        }
+    )
+
+    print("\n✅ 정상 운전 확인")
     
     # 결과 저장
-    output_dir = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "outputs", "results")
+    output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "outputs", "results")
     os.makedirs(output_dir, exist_ok=True)
     
-    output_file = os.path.join(output_dir, "result_temperature_anomaly.json")
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(result1, f, ensure_ascii=False, indent=2, default=str)
+    # 이상 케이스 저장
+    if result1.get('is_anomaly'):
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_file = os.path.join(output_dir, f"anomaly_result_{timestamp}.json")
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(result1, f, ensure_ascii=False, indent=2, default=str)
+        print(f"\n💾 이상 결과 저장: {output_file}")
+        
+        # 8D 리포트 저장
+        if result1.get('report_8d'):
+            report_file = os.path.join(output_dir, f"8D_Report_{timestamp}.txt")
+            with open(report_file, "w", encoding="utf-8") as f:
+                f.write(result1.get('report_8d'))
+            print(f"💾 8D 리포트 저장: {report_file}")
     
-    print(f"\n✅ 결과 저장: {output_file}")
-    
-    # 8D Report 출력
     print("\n" + "=" * 80)
-    print("📄 생성된 8D Report")
+    print("✅ 데모 완료!")
     print("=" * 80)
-    print(result1.get('report_8d', 'N/A')[:500] + "...")
-    
-    
-    # 테스트 시나리오 2: 정상 운전
-    print("\n\n" + "=" * 80)
-    print("테스트 시나리오 2: 정상 운전")
+    print("\n📌 다음 단계:")
+    print("   1. Streamlit 대시보드 실행:")
+    print("      cd 5_dashboard && streamlit run dashboard.py")
+    print("\n   2. 결과 확인:")
+    print(f"      ls {output_dir}")
+    print("\n   3. 모델 재학습 (새 데이터 추가 시):")
+    print("      cd 2_model_training && python train_best_2models.py")
     print("=" * 80)
-    
-    result2 = system.process_anomaly_event(
-        equipment_id="CNC-1호기",
-        sensor_data={
-            "temperature": 200.0,
-            "pressure": 120.0,
-            "vibration": 1.0,
-            "cycle_time": 50
-        }
-    )
-    
-    print("\n✅ 정상 운전 확인")
 
 
 if __name__ == "__main__":
@@ -315,16 +376,39 @@ if __name__ == "__main__":
     os.makedirs(os.path.join(project_root, "outputs", "results"), exist_ok=True)
     
     print("""
-    ⚠️  주의사항:
-    1. Detection Agent: 규칙 기반 또는 DeepOD 학습 필요
-       → cd 2_model_training && python test.py --model TimesNet
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║     🏭 AI 자율 운영 공정 시스템 - Press 이상 탐지 v1.0       ║
+    ╚═══════════════════════════════════════════════════════════════╝
     
-    2. LoRA 모델: train_lora.py 실행 필요
-       → cd 2_model_training && python train_lora.py
+    📋 시스템 구성:
+       - Detection: TimesNet + AnomalyTransformer 앙상블 (Recall 85%+)
+       - Retrieval: RAG 기반 지식 베이스 검색
+       - Action: LoRA LLM 기반 조치 방안 생성
+       - PM: 예방 정비 추천
+       - Report: 8D 리포트 자동 생성
     
-    3. 필요 패키지:
-       → pip install langchain langgraph faiss-cpu sentence-transformers deepod
+    ⚠️  사전 요구사항:
+       1. 이상 탐지 모델 학습 완료:
+          → cd 2_model_training && python train_best_2models.py
+       
+       2. 지식 베이스 구축 (옵션):
+          → cd 3_knowledge_base && python setup_rag.py --rebuild
+       
+       3. LoRA 모델 학습 (옵션):
+          → cd 2_model_training && python train_lora.py
+       
+       4. 필요 패키지:
+          → pip install deepod langchain langgraph faiss-cpu sentence-transformers
+    
+    🚀 시작합니다...
     """)
     
     # 실행
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n⏹️  사용자에 의해 중단되었습니다.")
+    except Exception as e:
+        print(f"\n\n❌ 오류 발생: {e}")
+        import traceback
+        traceback.print_exc()

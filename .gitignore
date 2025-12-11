@@ -34,7 +34,7 @@ env/
 /output/
 /logs/
 /results/
-
+.mat
 # --- 학습 결과 저장 폴더 (가장 중요) ---
 # 이 폴더 안에 체크포인트와 모델이 계속 쌓이므로 통째로 무시해야 합니다.
 manufacturing_lora_output/

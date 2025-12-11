@@ -15,7 +15,13 @@ class RetrievalAgent:
     """Retrieval Agent - RAG 기반 근거 검색"""
     
     def __init__(self, knowledge_base_path: str = "./knowledge_base"):
-        self.rag = RAGSystem(knowledge_base_path)
+        # 디버깅: 전달된 경로 확인
+        print(f"🔍 RetrievalAgent 초기화:")
+        print(f"   - 전달된 knowledge_base_path: {knowledge_base_path}")
+        print(f"   - type: {type(knowledge_base_path)}")
+        
+        # ChromaDB 사용하도록 설정
+        self.rag = RAGSystem(knowledge_base_path, use_chromadb=True)
         print("✅ Retrieval Agent 초기화 완료")
     
     def run(self, state: AgentState) -> AgentState:
